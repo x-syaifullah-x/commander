@@ -1,0 +1,68 @@
+name: LINUX_OS
+
+on:
+  push:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions: write-all
+    strategy:
+      matrix:
+        arch:
+          - amd64
+          # - arm64
+    env:
+      DEBIAN_FRONTEND : noninteractive
+      GITHUB_TOKEN    : ${{ secrets.GITHUB_TOKEN }}
+      ARCH            : ${{ matrix.arch }}
+      DOCKER_IMAGE    : debian:trixie
+      DOCKER_PLATFORM : linux/${{ matrix.arch }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.2'
+      - name: Update OS
+        run: |
+          sudo apt-get update 2>&1 >/dev/null
+      - name: Update submodule
+        run: |
+          git submodule update --init --recursive --remote --force --depth 1
+      - name: Build firmware
+        run: |
+          _ARCH_HOST=$(dpkg --print-architecture)
+          if [ "$_ARCH_HOST" != "$ARCH" ]; then
+            sudo apt apt-get --no-install-suggests --no-install-recommends qemu-user-static -y 2>&1 >/dev/null
+            docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+          fi
+          docker pull --platform $DOCKER_PLATFORM $DOCKER_IMAGE
+          _CONTAINER_NAME="x-build_firmware"
+          github_workspace=/github_workspace
+          docker create --name "$_CONTAINER_NAME" --privileged -e "DEBIAN_FRONTEND=noninteractive" -v "${{ github.workspace }}:$github_workspace" --entrypoint "tail" --platform "$DOCKER_PLATFORM" "$DOCKER_IMAGE" -f /dev/null
+          docker start $_CONTAINER_NAME
+          docker exec $_CONTAINER_NAME apt-get update 2>&1 >/dev/null
+          docker exec $_CONTAINER_NAME apt-get upgrade --no-install-suggests --no-install-recommends -y 2>&1 >/dev/null
+          docker exec $_CONTAINER_NAME apt-get install make --no-install-suggests --no-install-recommends -y 2>&1 >/dev/null
+          docker exec $_CONTAINER_NAME make -f $github_workspace/commander_firmware/Makefile dependencies
+          docker exec $_CONTAINER_NAME make -f $github_workspace/commander_firmware/Makefile configure
+          docker exec $_CONTAINER_NAME make -f $github_workspace/commander_firmware/Makefile build
+
+      - name: Build commander-vendor
+        run: |
+          sudo apt-get install make --no-install-suggests --no-install-recommends -y 2>&1 >/dev/null
+          sudo make -f commander_vendor/Makefile dependencies
+          make -f commander_vendor/Makefile build_static
+          ldd commander_vendor/build/commander-vendor || true
+
+      - name: Upload binary
+        run: |
+          VERSION_NAME="v1.0"
+          gh release create "${VERSION_NAME}" --title "$VERSION_NAME" --latest=true --generate-notes || true
+          gh release upload "${VERSION_NAME}" \
+          commander_firmware/build/firmware.uf2 commander_vendor/build/commander-vendor \
+          --clobber
